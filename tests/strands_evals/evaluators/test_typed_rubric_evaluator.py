@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import logging
+import pickle
 from datetime import datetime
 from unittest.mock import patch
 
@@ -148,7 +149,7 @@ def test_question_collections_are_immutable_copies():
 def test_question_to_dict_round_trips(question):
     data = question.to_dict()
     assert json.loads(json.dumps(data)) == data
-    rebuilt = TypedRubricEvaluator([data], model=None).questions[0]
+    rebuilt = TypedRubricEvaluator([data], model=None).questions["q1"]
     assert rebuilt == question
 
 
@@ -226,7 +227,7 @@ class Order(BaseModel):
     quantity: int
 
 
-async def test_state_holds_only_selected_fields_as_sorted_json():
+async def test_state_keeps_field_order_and_sorts_nested_keys():
     model = StubDecisionModel({"q1": YES})
     evaluator = TypedRubricEvaluator(
         [Noul("q")], model=model, state_fields=["metadata", "input", "actual_output", "expected_output"]
@@ -236,14 +237,14 @@ async def test_state_holds_only_selected_fields_as_sorted_json():
     state = model.calls[0][0]
     assert state == json.dumps(
         {
+            "metadata": {"a": [{"item": "x", "quantity": 2}], "b": 1},
+            "input": "What is 2+2?",
             "actual_output": "4",
             "expected_output": None,
-            "input": "What is 2+2?",
-            "metadata": {"a": [{"item": "x", "quantity": 2}], "b": 1},
         },
-        sort_keys=True,
         ensure_ascii=False,
     )
+    assert list(json.loads(state)) == ["metadata", "input", "actual_output", "expected_output"]
 
 
 async def test_state_is_identical_across_calls():
@@ -343,9 +344,9 @@ async def test_one_call_with_ids_choices_and_unchanged_text():
 
     assert len(model.calls) == 1
     assert model.calls[0][1] == {
-        "q1": {"question": "Is `actual_output` right?", "choices": "boolean"},
-        "q2": {"question": "How good?", "choices": ["poor", "ok", "good"]},
-        "q3": {"question": "Which?", "choices": ["b", "a"]},
+        "q1": {"question": "Is `actual_output` right?", "choices": "boolean", "uncertainty": False},
+        "q2": {"question": "How good?", "choices": ["poor", "ok", "good"], "uncertainty": False},
+        "q3": {"question": "Which?", "choices": ["b", "a"], "uncertainty": False},
     }
 
 
@@ -370,7 +371,6 @@ async def test_questions_are_rebuilt_for_every_call():
     "probabilities, answers, confidence, message",
     [
         ({"q1": YES}, {}, None, "no answer"),
-        ({"q1": YES}, {"q1": "yes"}, None, "not one of"),
         (None, {"q1": True}, None, "no probability distribution"),
         ({}, {"q1": True}, None, "no probability distribution"),
         ({"q1": {"true": 1.0}}, {"q1": True}, None, "cover exactly"),
@@ -389,13 +389,6 @@ async def test_malformed_responses_fail_the_whole_rubric(probabilities, answers,
         await evaluator.evaluate_async(_case())
 
 
-async def test_answer_outside_choices_is_rejected():
-    model = StubDecisionModel({"q1": {"a": 0.5, "b": 0.5}}, answers={"q1": "c"})
-    evaluator = TypedRubricEvaluator([Choice("q", options={"a": 1.0, "b": 0.0})], model=model)
-    with pytest.raises(ValueError, match="not one of"):
-        await evaluator.evaluate_async(_case())
-
-
 async def test_committed_answer_need_not_be_the_most_likely():
     model = StubDecisionModel({"q1": {"true": 0.4, "false": 0.6}}, answers={"q1": True})
     rows = await TypedRubricEvaluator([Noul("q")], model=model).evaluate_async(_case())
@@ -404,16 +397,10 @@ async def test_committed_answer_need_not_be_the_most_likely():
     assert rows[0].metadata["answer"] is True
 
 
-async def test_uncertain_answer_is_scored_from_its_distribution():
-    model = StubDecisionModel(
-        {"q1": {"true": 0.55, "false": 0.45}}, answers={"q1": Uncertain("low confidence")}, confidence={"q1": 0.1}
-    )
-    row = (await TypedRubricEvaluator([Noul("q")], model=model).evaluate_async(_case()))[0]
-    assert row.score == pytest.approx(0.55)
-    assert row.metadata["uncertain"] is True
-    assert row.metadata["answer"] == {"uncertain": True, "reason": "low confidence"}
-    assert row.metadata["confidence"] == 0.1
-    assert "answered uncertain (low confidence)" in row.reason
+async def test_uncertain_answer_despite_disabled_uncertainty_is_an_error():
+    model = StubDecisionModel({"q1": {"true": 0.55, "false": 0.45}}, answers={"q1": Uncertain("low confidence")})
+    with pytest.raises(ValueError, match="uncertainty was disabled"):
+        await TypedRubricEvaluator([Noul("q")], model=model).evaluate_async(_case())
 
 
 # --- scoring ----------------------------------------------------------------------------------
@@ -527,7 +514,6 @@ async def test_row_metadata_shape():
         "required": True,
         "pass_threshold": 0.5,
         "answer": True,
-        "uncertain": False,
         "selected_option": "true",
         "probabilities": YES,
         "confidence": 0.8,
@@ -676,9 +662,16 @@ def test_to_dict_writes_the_rubric_but_never_the_model(caplog):
 
     assert data == {
         "evaluator_type": "TypedRubricEvaluator",
-        "questions": [
-            {"type": "noul", "text": "q", "weight": 2.0, "required": False, "pass_threshold": None, "expected": True},
-            {
+        "questions": {
+            "q1": {
+                "type": "noul",
+                "text": "q",
+                "weight": 2.0,
+                "required": False,
+                "pass_threshold": None,
+                "expected": True,
+            },
+            "q2": {
                 "type": "choice",
                 "text": "c",
                 "weight": 1.0,
@@ -686,7 +679,7 @@ def test_to_dict_writes_the_rubric_but_never_the_model(caplog):
                 "pass_threshold": None,
                 "options": {"a": 1.0, "b": None},
             },
-        ],
+        },
         "model": None,
         "state_fields": ["input"],
         "pass_threshold": 0.7,
@@ -866,3 +859,53 @@ def test_row_metadata_survives_report_json_and_flatten(tmp_path):
         rows[0].metadata for report in reports for rows in report.detailed_results
     ]
     assert loaded.detailed_results[0][0].metadata["evaluated_by"] == "TypedRubricEvaluator"
+
+
+# --- question ids -----------------------------------------------------------------------------
+
+
+async def test_mapping_keys_become_question_ids():
+    model = StubDecisionModel({"helpful": YES, "safety": SAFETY_BY_INPUT["unsafe"]})
+    evaluator = TypedRubricEvaluator({"helpful": Noul("Is it helpful?"), "safety": SAFETY}, model=model)
+    rows = await evaluator.evaluate_async(_case())
+
+    assert list(model.calls[0][1]) == ["helpful", "safety"]
+    assert [row.metadata["question_id"] for row in rows] == ["helpful", "safety"]
+    _, passed, reason = evaluator.aggregator(rows)
+    assert passed is False
+    assert reason.startswith("required question safety failed | helpful: true (p=0.90)")
+
+
+def test_mapping_ids_survive_to_dict_and_insertion():
+    evaluator = TypedRubricEvaluator({"safety": SAFETY, "helpful": Noul("h")}, model=None)
+    data = evaluator.to_dict()
+    assert list(data["questions"]) == ["safety", "helpful"]
+
+    # Inserting a question keeps every existing id pointing at the same question.
+    rebuilt = TypedRubricEvaluator({"tone": Noul("t"), **data["questions"]}, model=None)
+    assert list(rebuilt.questions) == ["tone", "safety", "helpful"]
+    assert rebuilt.questions["safety"] == SAFETY
+    with pytest.raises(TypeError):
+        rebuilt.questions["safety"] = Noul("x")
+
+
+@pytest.mark.parametrize("questions", [{"": Noul("q")}, {" ": Noul("q")}, {1: Noul("q")}, {}])
+def test_invalid_question_ids_are_rejected(questions):
+    with pytest.raises(ValueError, match="question"):
+        TypedRubricEvaluator(questions, model=None)
+
+
+# --- copying ----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "question", [Noul("q", weight=2.0), Score("q", levels=["a", "b"]), Choice("q", options=RISK, required=True)]
+)
+def test_questions_deep_copy_and_pickle(question):
+    assert copy.deepcopy(question) == question
+    assert pickle.loads(pickle.dumps(question)) == question
+
+
+def test_evaluator_with_a_choice_deep_copies():
+    evaluator = TypedRubricEvaluator({"safety": SAFETY}, model=None)
+    assert copy.deepcopy(evaluator).to_dict() == evaluator.to_dict()

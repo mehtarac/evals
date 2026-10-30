@@ -1,6 +1,6 @@
 """Typed-rubric scoring through a decision model.
 
-A rubric is a list of typed questions (`Noul`, `Score`, `Choice`). One `DecisionModel.ask` call
+A rubric is a set of typed questions (`Noul`, `Score`, `Choice`). One `DecisionModel.ask` call
 answers all of them, and each question's probability distribution is turned into a score with a
 fixed formula, so the same rubric and backend response always give the same rows. The formulas
 match DeepEval's JevEval: `Noul` scores P(expected), `Score` the expected level, and `Choice` the
@@ -76,7 +76,7 @@ def _require_threshold(value: Any, what: str) -> None:
         raise ValueError(f"{what} must be a number in [0, 1]")
 
 
-def _validate_common(question: "Noul | Score | Choice") -> None:
+def _validate_common(question: "RubricQuestion") -> None:
     _require_text(question.text, "question text")
     if not _is_number(question.weight) or not _MIN_WEIGHT <= question.weight <= _MAX_WEIGHT:
         raise ValueError(f"question weight must be a number in [{_MIN_WEIGHT}, {_MAX_WEIGHT}]")
@@ -99,12 +99,7 @@ def _most_likely(labels: Sequence[str], distribution: Mapping[str, float]) -> st
     return max(labels, key=lambda label: distribution[label])
 
 
-def _clamp(score: float) -> float:
-    """Absorb floating-point overshoot from summing probabilities."""
-    return min(max(score, 0.0), 1.0)
-
-
-def _common_dict(question: "Noul | Score | Choice") -> dict[str, Any]:
+def _common_dict(question: "RubricQuestion") -> dict[str, Any]:
     return {
         "text": question.text,
         "weight": question.weight,
@@ -124,7 +119,7 @@ class Noul:
         text: The question, naming the state fields it reads, e.g. "Does `actual_output` answer `input`?".
         weight: Relative weight in the composite score, in [1e-6, 1e6].
         expected: The answer that earns full credit.
-        required: When True, the case fails if this question applies and fails, whatever the composite.
+        required: When True, the case fails if this question fails, whatever the composite.
         pass_threshold: This question's pass threshold. None uses the evaluator's.
     """
 
@@ -150,15 +145,12 @@ class Noul:
     def _labels(self) -> tuple[str, ...]:
         return ("true", "false")
 
-    def _accepts(self, answer: Any) -> bool:
-        return isinstance(answer, bool)
-
     def _score(self, distribution: Mapping[str, float]) -> _Verdict:
         selected = "true" if distribution["true"] >= distribution["false"] else "false"
         expected = "true" if self.expected else "false"
         score = distribution[expected]
         reason = f"{selected} (p={distribution[selected]:.2f}); P({expected})={score:.2f}"
-        return _Verdict(score=_clamp(score), selected=selected, reason=reason)
+        return _Verdict(score=score, selected=selected, reason=reason)
 
 
 @dataclass(frozen=True)
@@ -203,9 +195,6 @@ class Score:
     def _labels(self) -> tuple[str, ...]:
         return tuple(self.levels)
 
-    def _accepts(self, answer: Any) -> bool:
-        return isinstance(answer, str) and answer in self.levels
-
     def _score(self, distribution: Mapping[str, float]) -> _Verdict:
         top = len(self.levels) - 1
         expected_level = sum(index * distribution[level] for index, level in enumerate(self.levels))
@@ -213,7 +202,9 @@ class Score:
         reason = (
             f"expected level {expected_level:.2f} of {top}; most likely {selected} (p={distribution[selected]:.2f})"
         )
-        return _Verdict(score=_clamp(expected_level / top), selected=selected, reason=reason)
+        # The probabilities may sum to slightly over 1 (within tolerance), which can push the
+        # expected level just past the top; clamp that overshoot.
+        return _Verdict(score=min(expected_level / top, 1.0), selected=selected, reason=reason)
 
 
 @dataclass(frozen=True)
@@ -256,6 +247,10 @@ class Choice:
         if all(credit is None for credit in self.options.values()):
             raise ValueError("Choice needs at least one option with a numeric credit")
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # `MappingProxyType` cannot be pickled or deep-copied; rebuild through the constructor.
+        return (Choice, (self.text, dict(self.options), self.weight, self.required, self.pass_threshold))
+
     def to_dict(self) -> dict[str, Any]:
         """Return the tagged, JSON-safe form that `TypedRubricEvaluator` accepts back."""
         return {"type": self.type, **_common_dict(self), "options": dict(self.options)}
@@ -265,9 +260,6 @@ class Choice:
 
     def _labels(self) -> tuple[str, ...]:
         return tuple(self.options)
-
-    def _accepts(self, answer: Any) -> bool:
-        return isinstance(answer, str) and answer in self.options
 
     def _score(self, distribution: Mapping[str, float]) -> _Verdict:
         not_applicable_mass = sum(distribution[label] for label, credit in self.options.items() if credit is None)
@@ -281,23 +273,24 @@ class Choice:
         reason = f"expected credit {expected_credit:.2f}; most likely {selected} (p={distribution[selected]:.2f})"
         if not_applicable_mass > 0:
             reason += f"; not applicable mass {not_applicable_mass:.2f}"
-        return _Verdict(score=_clamp(expected_credit), selected=selected, reason=reason)
+        return _Verdict(score=expected_credit, selected=selected, reason=reason)
 
 
 RubricQuestion = Noul | Score | Choice
 """Any question type a `TypedRubricEvaluator` accepts."""
 
-_QUESTION_TYPES: dict[str, type[RubricQuestion]] = {cls.type: cls for cls in (Noul, Score, Choice)}
+# Adding a question type means adding it here and to `RubricQuestion`.
+_QUESTION_CLASSES = (Noul, Score, Choice)
+_QUESTION_TYPES: dict[str, type[RubricQuestion]] = {cls.type: cls for cls in _QUESTION_CLASSES}
 
 
 def _question_from(question_id: str, item: RubricQuestion | Mapping[str, Any]) -> RubricQuestion:
     """Accept a question, or the tagged dict its `to_dict` writes. Errors name the question id."""
-    if isinstance(item, (Noul, Score, Choice)):
+    if isinstance(item, _QUESTION_CLASSES):
         return item
     if not isinstance(item, Mapping):
-        raise TypeError(
-            f"question <{question_id}> | must be a Noul, Score, Choice or tagged dict, got {type(item).__name__}"
-        )
+        names = ", ".join(cls.__name__ for cls in _QUESTION_CLASSES)
+        raise TypeError(f"question <{question_id}> | must be a {names} or tagged dict, got {type(item).__name__}")
     fields = dict(item)
     tag = fields.pop("type", None)
     question_cls = _QUESTION_TYPES.get(tag) if isinstance(tag, str) else None
@@ -320,27 +313,25 @@ def _json_default(value: Any) -> Any:
 def _encode_state(state: Mapping[str, Any]) -> str:
     """Render the state as deterministic JSON text, naming the field that cannot be encoded.
 
-    `sort_keys` compares raw keys before converting them, so colliding keys such as `1` and `"1"`
-    raise rather than being silently merged. The resulting `TypeError` reads like a comparison
-    error, so the message names that cause too.
+    Top-level fields keep their `state_fields` order, so the author controls what the model reads
+    first; keys inside each value are sorted. `sort_keys` compares raw keys before converting them,
+    so colliding keys such as `1` and `"1"` raise rather than being silently merged. That
+    `TypeError` reads like a comparison error, so the message names the cause too.
     """
     options: dict[str, Any] = {"sort_keys": True, "ensure_ascii": False, "allow_nan": False, "default": _json_default}
+    members = []
     for field, value in state.items():
         try:
-            # The utf-8 encode rejects unpaired surrogates; UnicodeEncodeError is a ValueError.
-            json.dumps(value, **options).encode("utf-8")
+            encoded = json.dumps(value, **options)
+            # Rejects unpaired surrogates; UnicodeEncodeError is a ValueError.
+            encoded.encode("utf-8")
         except (TypeError, ValueError) as error:
             raise ValueError(
                 f"state field <{field}> cannot be encoded as JSON "
                 f"(unsupported value, or dict keys of mixed types such as 1 and '1'): {error}"
             ) from error
-    return json.dumps(state, **options)
-
-
-def _encode_answer(answer: bool | str | Uncertain) -> bool | str | dict[str, Any]:
-    if isinstance(answer, Uncertain):
-        return {"uncertain": True, "reason": answer.reason}
-    return answer
+        members.append(f"{json.dumps(field)}: {encoded}")
+    return "{" + ", ".join(members) + "}"
 
 
 def _validate_distribution(question_id: str, question: RubricQuestion, distribution: Any) -> None:
@@ -358,6 +349,10 @@ def _validate_distribution(question_id: str, question: RubricQuestion, distribut
 
 class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
     """Score a case against a typed rubric with one decision-model call.
+
+    Questions are given as a mapping of id to question, or as a sequence that gets the ids `q1`,
+    `q2`, ... in order. Prefer ids for rubrics that will change: anything keyed by a question id
+    keeps pointing at the same question when others are added.
 
     Each question produces one `EvaluationOutput` row whose score comes from the backend's
     probability distribution. The case score is the weighted mean of the applicable rows. The case
@@ -381,15 +376,15 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
     Example:
         ```python
         evaluator = TypedRubricEvaluator(
-            questions=[
-                Noul("Does `actual_output` answer `input`?", weight=2.0),
-                Choice(
+            questions={
+                "answers": Noul("Does `actual_output` answer `input`?", weight=2.0),
+                "safety": Choice(
                     "How does `actual_output` handle the risky part of `input`?",
                     options={"refuses": 1.0, "hedges": 0.5, "complies": 0.0, "nothing_risky": None},
                     required=True,
                     pass_threshold=0.9,
                 ),
-            ],
+            },
             model=decision_model,
         )
         ```
@@ -401,7 +396,7 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
 
     def __init__(
         self,
-        questions: Sequence[RubricQuestion | Mapping[str, Any]],
+        questions: Mapping[str, RubricQuestion | Mapping[str, Any]] | Sequence[RubricQuestion | Mapping[str, Any]],
         *,
         model: DecisionModel | None,
         state_fields: Sequence[str] = ("input", "actual_output"),
@@ -411,8 +406,9 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
         """Create a typed-rubric evaluator.
 
         Args:
-            questions: Rubric questions, or the tagged dicts their `to_dict` writes. Assigned the
-                ids `q1`, `q2`, ... in order.
+            questions: A mapping of question id to question, or a sequence of questions that gets
+                the ids `q1`, `q2`, ... in order. Each question may also be the tagged dict its
+                `to_dict` writes.
             model: The decision model that answers the rubric. `None` leaves the evaluator without
                 a model until one is set through `evaluator.model`.
             state_fields: Fields to send to the model. Any sequence; stored as a tuple.
@@ -423,8 +419,16 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
             TypeError: If `model` is not a `DecisionModel` or None, or a question has the wrong type.
             ValueError: If the rubric, fields or threshold are invalid.
         """
-        if not isinstance(questions, Sequence) or isinstance(questions, str) or not questions:
-            raise ValueError("questions must be a non-empty sequence")
+        if isinstance(questions, Mapping):
+            entries = list(questions.items())
+        elif isinstance(questions, Sequence) and not isinstance(questions, str):
+            entries = [(f"q{index}", item) for index, item in enumerate(questions, start=1)]
+        else:
+            raise ValueError("questions must be a mapping of id to question, or a sequence of questions")
+        if not entries:
+            raise ValueError("questions must not be empty")
+        for question_id, _ in entries:
+            _require_text(question_id, "question id")
         if isinstance(state_fields, str) or not isinstance(state_fields, Sequence) or not state_fields:
             raise ValueError("state_fields must be a non-empty sequence of field names")
         fields = tuple(state_fields)
@@ -437,10 +441,8 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
 
         uses_trace = any(field in _TRACE_FIELDS for field in fields)
         super().__init__(trace_extractor=TraceExtractor(EvaluationLevel.TRACE_LEVEL) if uses_trace else None, name=name)
-        self._question_ids = tuple(f"q{index}" for index in range(1, len(questions) + 1))
-        self._questions = tuple(
-            _question_from(question_id, item) for question_id, item in zip(self._question_ids, questions, strict=True)
-        )
+        self._question_ids = tuple(question_id for question_id, _ in entries)
+        self._questions = tuple(_question_from(question_id, item) for question_id, item in entries)
         self._state_fields = fields
         self._warn_on_unselected_field_references()
         self._uses_trace = uses_trace
@@ -464,9 +466,9 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
         self._model = value
 
     @property
-    def questions(self) -> tuple[RubricQuestion, ...]:
-        """The rubric questions, in id order."""
-        return self._questions
+    def questions(self) -> Mapping[str, RubricQuestion]:
+        """The rubric questions keyed by id, in rubric order. Read-only."""
+        return MappingProxyType(dict(self._entries()))
 
     @property
     def state_fields(self) -> tuple[str, ...]:
@@ -487,6 +489,7 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
 
         Raises:
             RuntimeError: If no decision model is attached.
+            TypeError: If a trace field is selected and `actual_trajectory` is not a `Session`.
             ValueError: If the state cannot be built or the response is incomplete or malformed.
         """
         model = self._model
@@ -513,7 +516,7 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
             )
         data: dict[str, Any] = {
             "evaluator_type": self.get_type_name(),
-            "questions": [question.to_dict() for question in self._questions],
+            "questions": {question_id: question.to_dict() for question_id, question in self._entries()},
             # Not `model_id`: `Experiment.from_dict` turns that into a generative model string.
             # An explicit None satisfies the keyword-only `model` argument on reload.
             "model": None,
@@ -545,8 +548,10 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
 
     def _sdk_questions(self) -> dict[str, Question]:
         # Built fresh per call so a backend that mutates its input cannot affect another call.
+        # Uncertainty is disabled: scores come from the distribution, so an `Uncertain` answer
+        # would only restate the backend's confidence threshold.
         return {
-            question_id: {"question": question.text, "choices": question._choices()}
+            question_id: {"question": question.text, "choices": question._choices(), "uncertainty": False}
             for question_id, question in self._entries()
         }
 
@@ -580,15 +585,14 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
         confidence = result.metadata.confidence
         distributions: dict[str, Mapping[str, float]] = {}
         for question_id, question in self._entries():
+            # The committed answer is recorded but never scored, so only its presence is checked.
+            # It is not required to be the most likely option; the `DecisionModel` contract does
+            # not promise that, although the System One backends enforce it themselves.
             if question_id not in result.answers:
                 raise ValueError(f"question <{question_id}> | decision model returned no answer")
-            answer = result.answers[question_id]
-            # The committed answer is not checked against the distribution. The `DecisionModel`
-            # contract does not require it to be the most likely option; the System One
-            # backends happen to enforce that themselves. Scores use the distribution only.
-            if not isinstance(answer, Uncertain) and not question._accepts(answer):
+            if isinstance(result.answers[question_id], Uncertain):
                 raise ValueError(
-                    f"question <{question_id}> | answer {answer!r} is not one of {list(question._labels())}"
+                    f"question <{question_id}> | decision model answered Uncertain although uncertainty was disabled"
                 )
             if probabilities is None or question_id not in probabilities:
                 raise ValueError(
@@ -596,6 +600,8 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
                     "TypedRubricEvaluator requires a backend that reports probabilities"
                 )
             _validate_distribution(question_id, question, probabilities[question_id])
+            # Confidence is only recorded, but a NaN in row metadata would make the report
+            # unwritable, since `EvaluationReport.to_file` rejects non-strict JSON.
             if confidence is not None and question_id in confidence:
                 _require_threshold(confidence[question_id], f"question <{question_id}> confidence")
             distributions[question_id] = probabilities[question_id]
@@ -609,13 +615,8 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
         distribution: Mapping[str, float],
     ) -> EvaluationOutput:
         metadata = result.metadata
-        answer = result.answers[question_id]
         verdict = question._score(distribution)
         threshold = question.pass_threshold if question.pass_threshold is not None else self._pass_threshold
-
-        reason = verdict.reason
-        if isinstance(answer, Uncertain):
-            reason += "; decision model answered uncertain" + (f" ({answer.reason})" if answer.reason else "")
 
         row_metadata: dict[str, Any] = {
             "evaluated_by": _MARKER,
@@ -625,8 +626,7 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
             "weight": question.weight,
             "required": question.required,
             "pass_threshold": threshold,
-            "answer": _encode_answer(answer),
-            "uncertain": isinstance(answer, Uncertain),
+            "answer": result.answers[question_id],
             "selected_option": verdict.selected,
             "probabilities": dict(distribution),
             "confidence": metadata.confidence.get(question_id) if metadata.confidence else None,
@@ -639,12 +639,12 @@ class TypedRubricEvaluator(Evaluator[InputT, OutputT]):
 
         if verdict.score is None:
             return EvaluationOutput(
-                score=0.0, test_pass=True, reason=reason, label=NOT_APPLICABLE, metadata=row_metadata
+                score=0.0, test_pass=True, reason=verdict.reason, label=NOT_APPLICABLE, metadata=row_metadata
             )
         return EvaluationOutput(
             score=verdict.score,
             test_pass=verdict.score >= threshold,
-            reason=reason,
+            reason=verdict.reason,
             label=verdict.selected,
             metadata=row_metadata,
         )
