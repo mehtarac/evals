@@ -1902,6 +1902,7 @@ def test_label_follows_test_pass_only_for_evaluators_that_opt_in():
     assert _get_label_from_score(GatedEvaluator(), 0.8, judged) == "YES"
     assert _get_label_from_score(GatedEvaluator(), 0.0, not_applicable, passed=True) == NOT_APPLICABLE
     assert _get_label_from_score(MockEvaluator(), 0.8, judged, passed=False) == "YES"
+    assert Evaluator._label_from_test_pass is False
 
 
 def test_deterministic_evaluator_error_isolation():

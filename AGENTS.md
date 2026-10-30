@@ -493,7 +493,7 @@ If you are an agent opening a PR on behalf of a contributor, the human is the au
 
 When reviewing a PR in this repo, scan for all of the following:
 
-1. **Evaluator changes**: confirm the class still extends `Evaluator[InputT, OutputT]`, still returns `list[EvaluationOutput]`, and still uses `Agent(...)` for LLM calls. Confirm the default model has not silently regressed from the current default.
+1. **Evaluator changes**: confirm the class still extends `Evaluator[InputT, OutputT]`, still returns `list[EvaluationOutput]`, and still uses `Agent(...)` for LLM calls. Decision-model evaluators (`TypedRubricEvaluator`) are the exception: they call a `strands.decisions.DecisionModel` and make no `Agent` call. Confirm the default model has not silently regressed from the current default.
 2. **Prompt changes**: check that a new version module (`{name}_v1.py`) was added rather than overwriting `_v0.py`, if the PR is billed as a prompt change rather than a bugfix.
 3. **Detector changes**: preserve the text-mode streaming in `failure_detector.py` and the three-tier fallback in `root_cause_analyzer.py` unless explicitly targeted.
 4. **Session/trace schema**: if the PR changes fields on `Session`, `Trace`, or `SpanUnion`, every mapper in `mappers/` must still produce valid instances. Check each.

@@ -96,7 +96,7 @@ def _get_label_from_score(
     if outputs is not None and not EvaluationReport.is_applicable(outputs):
         return NOT_APPLICABLE
 
-    if passed is not None and getattr(evaluator, "_label_from_test_pass", False):
+    if passed is not None and evaluator._label_from_test_pass:
         return "YES" if passed else "NO"
 
     if hasattr(evaluator, "_score_mapping") and evaluator._score_mapping:

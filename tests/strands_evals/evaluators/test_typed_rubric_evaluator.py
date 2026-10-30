@@ -103,17 +103,18 @@ YES = {"true": 0.9, "false": 0.1}
         (lambda: Noul("q", required="yes"), "required"),
         (lambda: Noul("q", pass_threshold=1.5), "pass_threshold"),
         (lambda: Noul("q", pass_threshold=True), "pass_threshold"),
-        (lambda: Score("q", levels=["only"]), "2 to 10"),
-        (lambda: Score("q", levels=[str(i) for i in range(11)]), "2 to 10"),
+        (lambda: Score("q", levels=["only"]), "at least 2"),
         (lambda: Score("q", levels="ab"), "sequence"),
         (lambda: Score("q", levels=["a", "a"]), "distinct"),
         (lambda: Score("q", levels=["a", "uncertain"]), "reserved"),
+        (lambda: Score("q", levels=["not_applicable", "poor", "good"]), "reserved"),
         (lambda: Score("q", levels=["a", " "]), "label"),
         (lambda: Choice("q", options={"a": 1.0}), "at least 2"),
         (lambda: Choice("q", options={"a": 1.5, "b": 0.0}), "credit"),
         (lambda: Choice("q", options={"a": True, "b": 0.0}), "credit"),
         (lambda: Choice("q", options={"a": None, "b": None}), "numeric credit"),
         (lambda: Choice("q", options={"uncertain": 1.0, "b": 0.0}), "reserved"),
+        (lambda: Choice("q", options={"yes": 1.0, "partially": 0.5, "not_applicable": 0.0}), "reserved"),
         (lambda: Choice("q", options=[("a", 1.0), ("b", 0.0)]), "mapping"),
     ],
 )
@@ -149,6 +150,17 @@ def test_question_to_dict_round_trips(question):
     assert json.loads(json.dumps(data)) == data
     rebuilt = TypedRubricEvaluator([data], model=None).questions[0]
     assert rebuilt == question
+
+
+def test_score_allows_more_than_ten_levels():
+    assert len(Score("Rate it from 0 to 10", levels=[str(i) for i in range(11)]).levels) == 11
+
+
+def test_invalid_tagged_question_names_its_id():
+    with pytest.raises(ValueError, match=r"question <q2> \| question weight"):
+        TypedRubricEvaluator([Noul("ok"), {"type": "noul", "text": "q", "weight": 0}], model=None)
+    with pytest.raises(TypeError, match=r"question <q1> \| .*wieght"):
+        TypedRubricEvaluator([{"type": "noul", "text": "q", "wieght": 2}], model=None)
 
 
 @pytest.mark.parametrize(
@@ -261,6 +273,29 @@ async def test_unencodable_state_names_the_field(metadata):
     with pytest.raises(ValueError, match="state field <metadata>"):
         await evaluator.evaluate_async(_case(metadata=metadata))
     assert model.calls == []
+
+
+async def test_key_collision_error_names_the_likely_cause():
+    evaluator = _evaluator([Noul("q")], {"q1": YES}, state_fields=["metadata"])
+    with pytest.raises(ValueError, match="dict keys of mixed types"):
+        await evaluator.evaluate_async(_case(metadata={"x": {1: "a", "1": "b"}}))
+
+
+def test_question_naming_an_unselected_field_warns(caplog):
+    with caplog.at_level(logging.WARNING):
+        TypedRubricEvaluator(
+            [
+                Noul("Does `actual_output` match `expected_output`?"),
+                Noul("Does `actual_output` call `search`?"),
+                Noul("Is `input` answered?"),
+            ],
+            model=None,
+        )
+    warnings = [record.getMessage() for record in caplog.records if "not in state_fields" in record.getMessage()]
+    assert warnings == [
+        "evaluator=<TypedRubricEvaluator>, question_id=<q1>, fields=<expected_output> | question names fields "
+        "that are not in state_fields so the decision model cannot see them"
+    ]
 
 
 async def test_trace_fields_come_from_the_last_turn():
@@ -487,6 +522,7 @@ async def test_row_metadata_shape():
         "evaluated_by": "TypedRubricEvaluator",
         "question_id": "q1",
         "question_type": "noul",
+        "question": "q",
         "weight": 2.0,
         "required": True,
         "pass_threshold": 0.5,

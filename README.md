@@ -600,8 +600,8 @@ Requires the `stickler` extra: `pip install "strands-agents-evals[stickler]"`.
 `TypedRubricEvaluator` sends a rubric of typed questions to a `strands.decisions.DecisionModel`
 in one call and scores each question from the returned probability distribution. A fixed
 response always gives the same scores and reasons. It needs a backend that reports
-probabilities, such as `TypeSafeDecisionModel`; `LLMDecisionModel` returns committed answers
-only and is rejected.
+probabilities, such as `TypeSafeDecisionModel`. `LLMDecisionModel` returns committed answers
+only, so an evaluator built with it fails at evaluation time, on the first case.
 
 ```python
 from strands.decisions import TypeSafeDecisionModel
@@ -632,6 +632,9 @@ report = Experiment(cases=cases, evaluators=[rubric]).run_evaluations(task)
 | `Noul` (yes/no) | P(expected answer) |
 | `Score` (ordered levels, worst first) | Expected level, scaled to [0, 1] |
 | `Choice` (options with credits) | Expected credit over options with a numeric credit. When `None`-credit options hold at least half the probability, the row is not applicable and is left out of the composite |
+
+Questions name the fields they read in backticks. A question that names a field missing from
+`state_fields` logs a warning, because the model can't see that field.
 
 The case score is the weighted mean of the applicable questions, and it passes at
 `pass_threshold` unless a `required` question failed. Each row's `metadata` keeps the
